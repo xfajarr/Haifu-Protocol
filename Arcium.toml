@@ -1,0 +1,25 @@
+[localnet]
+# number of nodes in the single cluster of the localnet
+nodes = 2
+# optional nodes ips overrides (default: 172.20.0.[100..(100 + nodes - 1)])
+nodes_ips = [
+  [172, 20, 0, 100],
+  [172, 20, 0, 101]
+]
+# number of seconds to wait for the localnet to come online
+localnet_timeout_secs = 60
+# mpc backends this mxe supports (default: ["cerberus"])
+# supported values: "cerberus"
+backends = ["cerberus"]
+
+# cluster offsets for non-localnet testing
+# get your offset from `arcium init-mxe` or `arcium deploy`
+# rpc urls are configured in anchor.toml's [provider] section
+#
+# example usage: arcium test --cluster devnet
+#
+[clusters.devnet]
+offset = 456
+#
+# [clusters.mainnet]
+# offset = 0
