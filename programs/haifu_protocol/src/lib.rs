@@ -1,7 +1,7 @@
 #![allow(unused_variables)]
 use anchor_lang::prelude::*;
 use arcium_anchor::prelude::*;
-use anchor_spl::token::{Mint, Token, TokenAccount};
+use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 
 declare_id!("4RP7dPJizhmLcDSCskyq3ftSqmZMJfjyoubSotdCXfnb");
 
@@ -48,6 +48,80 @@ pub mod haifu_protocol {
     milestone_mxe_id:  Option<[u8; 32]>,
     milestone_target:  Option<u64>,
   ) -> Result<()> {
+
+    let clock = Clock::get()?;
+        
+    require!(amount > 0, HaifuError::InvalidAmount);
+    require!(start_time >= clock.unix_timestamp, HaifuError::InvalidStartTime);
+    require!(cliff_time >= start_time, HaifuError::InvalidCliffTime);
+    require!(end_time > cliff_time, HaifuError::InvalidEndTime);
+    require!(
+        ctx.accounts.creator.key() != recipient,
+        HaifuError::SameCreatorAndRecipient
+    );
+    
+    // Milestone-specific validation
+    if stream_type == StreamType::Milestone {
+        require!(
+            milestone_mxe_id.is_some() && milestone_target.is_some(),
+            HaifuError::MissingMilestoneParams
+        );
+    }
+    
+    // Check creator has sufficient funds
+    require!(
+        ctx.accounts.creator_ata.amount >= amount,
+        HaifuError::InsufficientFunds
+    );
+
+    // ── Logic ──────────────────────────────────────────────────────────────
+    
+    // 1. Increment counter → derive stream_id
+    let counter = &mut ctx.accounts.creator_stream_counter;
+    let stream_id = counter.count;
+    counter.count = counter
+        .count
+        .checked_add(1)
+        .ok_or(HaifuError::ArithmeticOverflow)?;
+
+    // 2. Initialize StreamAccount
+    let stream = &mut ctx.accounts.stream;
+    stream.creator               = ctx.accounts.creator.key();
+    stream.recipient             = recipient;
+    stream.mint                  = ctx.accounts.mint.key();
+    stream.escrow_token_account  = ctx.accounts.escrow_token_account.key();
+    stream.total_amount          = amount;
+    stream.amount_withdrawn      = 0;
+    stream.start_time            = start_time;
+    stream.cliff_time            = cliff_time;
+    stream.end_time              = end_time;
+    stream.stream_type           = stream_type.clone();
+    stream.milestone_mxe_id      = milestone_mxe_id;
+    stream.milestone_target      = milestone_target;
+    stream.is_cancelled          = false;
+    stream.stream_id             = stream_id;
+    stream.bump                  = ctx.bumps.stream;
+
+    // 3. CPI: Transfer tokens from creator → escrow
+    let cpi_accounts = Transfer {
+        from:      ctx.accounts.creator_ata.to_account_info(),
+        to:        ctx.accounts.escrow_token_account.to_account_info(),
+        authority: ctx.accounts.creator.to_account_info(),
+    };
+    let cpi_program = ctx.accounts.token_program.to_account_info();
+    let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
+    token::transfer(cpi_ctx, amount)?;
+
+    // 4. Emit event
+    emit!(StreamCreatedEvent {
+        creator:     ctx.accounts.creator.key(),
+        recipient,
+        amount,
+        stream_type: stream.stream_type.clone(),
+        start_time,
+        cliff_time,
+        end_time,
+    });
     Ok(())
   }
 
@@ -449,4 +523,32 @@ pub enum HaifuError {
   // Arithmetic
   #[msg("Arithmetic overflow detected.")]
   ArithmeticOverflow,
+}
+
+// Events
+//
+
+
+#[event]
+pub struct StreamCreatedEvent {
+    pub creator:     Pubkey,
+    pub recipient:   Pubkey,
+    pub amount:      u64,
+    pub stream_type: StreamType,
+    pub start_time:  i64,
+    pub cliff_time:  i64,
+    pub end_time:    i64,
+}
+ 
+#[event]
+pub struct TokensWithdrawnEvent {
+    pub stream:    Pubkey,
+    pub recipient: Pubkey,
+    pub amount:    u64,
+}
+ 
+#[event]
+pub struct StreamCancelledEvent {
+    pub stream:          Pubkey,
+    pub refunded_amount: u64,
 }
