@@ -1,216 +1,290 @@
+/**
+ * Token Distribution Platform — Test Suite
+ *
+ * Week 3 scope: verify the program deploys and all instruction handlers
+ * exist and are callable (no business logic yet).
+ *
+ * Run with:
+ *   arcium test               (localnet)
+ *   arcium test --cluster devnet
+ */
+
 import * as anchor from "@coral-xyz/anchor";
-import { Program } from "@coral-xyz/anchor";
-import { PublicKey } from "@solana/web3.js";
-import { HaifuProtocol } from "../target/types/haifu_protocol";
-import { randomBytes } from "crypto";
+import { Program, BN }  from "@coral-xyz/anchor";
+import { PublicKey, Keypair, SystemProgram } from "@solana/web3.js";
 import {
-  awaitComputationFinalization,
+  TOKEN_PROGRAM_ID,
+  createMint,
+  createAssociatedTokenAccount,
+  mintTo,
+} from "@solana/spl-token";
+import {
   getArciumEnv,
-  getCompDefAccOffset,
-  getArciumAccountBaseSeed,
-  getArciumProgramId,
-  getArciumProgram,
-  uploadCircuit,
-  RescueCipher,
-  deserializeLE,
-  getMXEPublicKey,
+  getClusterAccAddress,
   getMXEAccAddress,
   getMempoolAccAddress,
-  getCompDefAccAddress,
   getExecutingPoolAccAddress,
   getComputationAccAddress,
-  getClusterAccAddress,
-  getLookupTableAddress,
-  x25519,
+  getCompDefAccAddress,
+  getCompDefAccOffset,
+  getArciumProgramId
 } from "@arcium-hq/client";
-import * as fs from "fs";
-import * as os from "os";
+import { x25519 } from "@noble/curves/ed25519";
+import { randomBytes } from "@noble/hashes/utils";
 import { expect } from "chai";
 
-describe("HaifuProtocol", () => {
-  // Configure the client to use the local cluster.
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function randomOffset(): BN {
+  return new BN(randomBytes(8), "hex");
+}
+
+// ─── Test suite ───────────────────────────────────────────────────────────────
+
+describe("Token Distribution Platform", () => {
+  // Configure anchor to use the local test validator.
   anchor.setProvider(anchor.AnchorProvider.env());
-  const program = anchor.workspace
-    .HaifuProtocol as Program<HaifuProtocol>;
-  const provider = anchor.getProvider();
-  const arciumProgram = getArciumProgram(provider as anchor.AnchorProvider);
-
-  type Event = anchor.IdlEvents<(typeof program)["idl"]>;
-  const awaitEvent = async <E extends keyof Event>(
-    eventName: E,
-  ): Promise<Event[E]> => {
-    let listenerId: number;
-    const event = await new Promise<Event[E]>((res) => {
-      listenerId = program.addEventListener(eventName, (event) => {
-        res(event);
-      });
-    });
-    await program.removeEventListener(listenerId);
-
-    return event;
-  };
+  const provider = anchor.getProvider() as anchor.AnchorProvider;
+  const program  = anchor.workspace
+    .TokenDistributionPlatform as Program<TokenDistributionPlatform>;
 
   const arciumEnv = getArciumEnv();
-  const clusterAccount = getClusterAccAddress(arciumEnv.arciumClusterOffset);
 
-  it("Is initialized!", async () => {
-    const owner = readKpJson(`${os.homedir()}/.config/solana/id.json`);
+  // ── Keypairs & mutable state ───────────────────────────────────────────────
+  let tokenMint:           PublicKey;
+  let senderTokenAccount:  PublicKey;
+  let recipientTokenAccount: PublicKey;
 
-    console.log("Initializing add together computation definition");
-    const initATSig = await initAddTogetherCompDef(program, owner);
-    console.log(
-      "Add together computation definition initialized with signature",
-      initATSig,
+  const sender    = Keypair.generate();
+  const recipient = Keypair.generate();
+
+  // ── One-time setup ─────────────────────────────────────────────────────────
+  before("fund wallets and create SPL mint", async () => {
+    // Airdrop SOL to sender & recipient on localnet.
+    for (const kp of [sender, recipient]) {
+      const sig = await provider.connection.requestAirdrop(
+        kp.publicKey,
+        2 * anchor.web3.LAMPORTS_PER_SOL,
+      );
+      await provider.connection.confirmTransaction(sig, "confirmed");
+    }
+
+    // Create a test SPL token mint (decimals = 6).
+    tokenMint = await createMint(
+      provider.connection,
+      sender,
+      sender.publicKey,
+      null,
+      6,
     );
 
-    const mxePublicKey = await getMXEPublicKeyWithRetry(
-      provider as anchor.AnchorProvider,
-      program.programId,
+    // Create associated token accounts.
+    senderTokenAccount = await createAssociatedTokenAccount(
+      provider.connection,
+      sender,
+      tokenMint,
+      sender.publicKey,
+    );
+    recipientTokenAccount = await createAssociatedTokenAccount(
+      provider.connection,
+      recipient,
+      tokenMint,
+      recipient.publicKey,
     );
 
-    console.log("MXE x25519 pubkey is", mxePublicKey);
-
-    const privateKey = x25519.utils.randomSecretKey();
-    const publicKey = x25519.getPublicKey(privateKey);
-
-    const sharedSecret = x25519.getSharedSecret(privateKey, mxePublicKey);
-    const cipher = new RescueCipher(sharedSecret);
-
-    const val1 = BigInt(1);
-    const val2 = BigInt(2);
-    const plaintext = [val1, val2];
-
-    const nonce = randomBytes(16);
-    const ciphertext = cipher.encrypt(plaintext, nonce);
-
-    const sumEventPromise = awaitEvent("sumEvent");
-    const computationOffset = new anchor.BN(randomBytes(8), "hex");
-
-    const queueSig = await program.methods
-      .addTogether(
-        computationOffset,
-        Array.from(ciphertext[0]),
-        Array.from(ciphertext[1]),
-        Array.from(publicKey),
-        new anchor.BN(deserializeLE(nonce).toString()),
-      )
-      .accountsPartial({
-        computationAccount: getComputationAccAddress(
-          arciumEnv.arciumClusterOffset,
-          computationOffset,
-        ),
-        clusterAccount,
-        mxeAccount: getMXEAccAddress(program.programId),
-        mempoolAccount: getMempoolAccAddress(arciumEnv.arciumClusterOffset),
-        executingPool: getExecutingPoolAccAddress(
-          arciumEnv.arciumClusterOffset,
-        ),
-        compDefAccount: getCompDefAccAddress(
-          program.programId,
-          Buffer.from(getCompDefAccOffset("add_together")).readUInt32LE(),
-        ),
-      })
-      .rpc({ skipPreflight: true, commitment: "confirmed" });
-    console.log("Queue sig is ", queueSig);
-
-    const finalizeSig = await awaitComputationFinalization(
-      provider as anchor.AnchorProvider,
-      computationOffset,
-      program.programId,
-      "confirmed",
+    // Mint 1 000 tokens to sender.
+    await mintTo(
+      provider.connection,
+      sender,
+      tokenMint,
+      senderTokenAccount,
+      sender,
+      1_000 * 1_000_000, // 1,000 tokens @ 6 decimals
     );
-    console.log("Finalize sig is ", finalizeSig);
-
-    const sumEvent = await sumEventPromise;
-    const decrypted = cipher.decrypt([sumEvent.sum], new Uint8Array(sumEvent.nonce))[0];
-    expect(decrypted).to.equal(val1 + val2);
   });
 
-  async function initAddTogetherCompDef(
-    program: Program<HaifuProtocol>,
-    owner: anchor.web3.Keypair,
-  ): Promise<string> {
-    const baseSeedCompDefAcc = getArciumAccountBaseSeed(
-      "ComputationDefinitionAccount",
-    );
-    const offset = getCompDefAccOffset("add_together");
+  // ── Test 1: program is deployed ────────────────────────────────────────────
+  it("program is deployed and reachable", async () => {
+    const info = await provider.connection.getAccountInfo(program.programId);
+    expect(info).to.not.be.null;
+    expect(info!.executable).to.be.true;
+    console.log("  ✓ program ID:", program.programId.toBase58());
+  });
 
-    const compDefPDA = PublicKey.findProgramAddressSync(
-      [baseSeedCompDefAcc, program.programId.toBuffer(), offset],
-      getArciumProgramId(),
-    )[0];
-
-    console.log("Comp def pda is ", compDefPDA);
-
-    const mxeAccount = getMXEAccAddress(program.programId);
-    const mxeAcc = await arciumProgram.account.mxeAccount.fetch(mxeAccount);
-    const lutAddress = getLookupTableAddress(program.programId, mxeAcc.lutOffsetSlot);
-
-    const sig = await program.methods
-      .initAddTogetherCompDef()
-      .accounts({
-        compDefAccount: compDefPDA,
-        payer: owner.publicKey,
-        mxeAccount,
-        addressLookupTable: lutAddress,
-      })
-      .signers([owner])
-      .rpc({
-        commitment: "confirmed",
-      });
-    console.log("Init add together computation definition transaction", sig);
-
-    const rawCircuit = fs.readFileSync("build/add_together.arcis");
-    await uploadCircuit(
-      provider as anchor.AnchorProvider,
-      "add_together",
+  // ── Test 2: init computation definitions ───────────────────────────────────
+  it("initializes verify_stream_rate computation definition", async () => {
+    const [compDefPda] = PublicKey.findProgramAddressSync(
+      [
+        Buffer.from("comp_def"),
+        sender.publicKey.toBuffer(),
+        Buffer.from(
+          getCompDefAccOffset("verify_stream_rate"),
+        ),
+      ],
       program.programId,
-      rawCircuit,
-      true,
-      500,
-      {
-        skipPreflight: true,
-        preflightCommitment: "confirmed",
-        commitment: "confirmed",
-      },
     );
 
-    return sig;
-  }
+    const tx = await program.methods
+      .initVerifyStreamCompDef()
+      .accounts({
+        payer:           sender.publicKey,
+        compDefAccount:  compDefPda,
+        mxeAccount:      getMXEAccAddress(program.programId),
+        arciumProgram:   getArciumProgramId(),
+        systemProgram:   SystemProgram.programId,
+      })
+      .signers([sender])
+      .rpc({ commitment: "confirmed" });
+
+    console.log("  ✓ verify_stream_rate comp def initialized:", tx);
+  });
+
+  it("initializes compute_withdraw_amount computation definition", async () => {
+    const [compDefPda] = PublicKey.findProgramAddressSync(
+      [
+        Buffer.from("comp_def"),
+        sender.publicKey.toBuffer(),
+        Buffer.from(
+          getCompDefAccOffset("compute_withdraw_amount"),
+        ),
+      ],
+      program.programId,
+    );
+
+    const tx = await program.methods
+      .initComputeWithdrawCompDef()
+      .accounts({
+        payer:           sender.publicKey,
+        compDefAccount:  compDefPda,
+        mxeAccount:      getMXEAccAddress(program.programId),
+        arciumProgram:   getArciumProgramId(),
+        systemProgram:   SystemProgram.programId,
+      })
+      .signers([sender])
+      .rpc({ commitment: "confirmed" });
+
+    console.log("  ✓ compute_withdraw_amount comp def initialized:", tx);
+  });
+
+  // ── Test 3: create_stream stub ─────────────────────────────────────────────
+  it("create_stream handler is callable (stub — no logic yet)", async () => {
+    const computationOffset = randomOffset();
+    const now = Math.floor(Date.now() / 1000);
+
+    // Derive PDAs.
+    const [streamPda] = PublicKey.findProgramAddressSync(
+      [
+        Buffer.from("stream"),
+        sender.publicKey.toBuffer(),
+        recipient.publicKey.toBuffer(),
+        tokenMint.toBuffer(),
+      ],
+      program.programId,
+    );
+    const [escrowPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("escrow"), streamPda.toBuffer()],
+      program.programId,
+    );
+    const [signPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("sign_pda")],
+      program.programId,
+    );
+    const [compDefPda] = PublicKey.findProgramAddressSync(
+      [
+        Buffer.from("comp_def"),
+        sender.publicKey.toBuffer(),
+        Buffer.from(
+          getCompDefAccOffset("verify_stream_rate"),
+        ),
+      ],
+      program.programId,
+    );
+    const computationAcc = getComputationAccAddress(
+      arciumEnv.arciumClusterOffset,
+      computationOffset,
+    );
+
+    // Dummy encrypted args (real encryption done by client in Week 4).
+    const dummyCiphertext = Array(32).fill(0) as number[];
+    const dummyPubKey     = Array.from(x25519.getPublicKey(randomBytes(32)));
+    const dummyNonce      = new BN(0);
+
+    const tx = await program.methods
+      .createStream(
+        new BN(100_000_000),     // total_amount
+        new BN(now),             // start_time
+        new BN(now + 60),        // cliff_date (1 min)
+        new BN(now + 3600),      // end_time   (1 hr)
+        new BN(27_777),          // rate_per_second ≈ 100 tokens / 3600 s
+        computationOffset,
+        dummyCiphertext,
+        dummyPubKey,
+        dummyNonce,
+      )
+      .accounts({
+        sender:               sender.publicKey,
+        recipient:            recipient.publicKey,
+        tokenMint,
+        stream:               streamPda,
+        escrowTokenAccount:   escrowPda,
+        senderTokenAccount,
+        computationAccount:   computationAcc,
+        clusterAccount:       getClusterAccAddress(arciumEnv.arciumClusterOffset),
+        mxeAccount:           getMXEAccAddress(program.programId),
+        mempoolAccount:       getMempoolAccAddress(arciumEnv.arciumClusterOffset),
+        executingPool:        getExecutingPoolAccAddress(arciumEnv.arciumClusterOffset),
+        compDefAccount:       compDefPda,
+        signPdaAccount:       signPda,
+        tokenProgram:         TOKEN_PROGRAM_ID,
+        systemProgram:        SystemProgram.programId,
+        arciumProgram:        getArciumProgramId(),
+      })
+      .signers([sender])
+      .rpc({ commitment: "confirmed" });
+
+    console.log("  ✓ create_stream tx:", tx);
+
+    // Verify the stream account was created with correct data.
+    const stream = await program.account.streamAccount.fetch(streamPda);
+    expect(stream.sender.toBase58()).to.equal(sender.publicKey.toBase58());
+    expect(stream.recipient.toBase58()).to.equal(recipient.publicKey.toBase58());
+    expect(stream.isCancelled).to.be.false;
+    console.log("  ✓ StreamAccount persisted correctly");
+  });
+
+  // ── Test 4: cancel stub ────────────────────────────────────────────────────
+  it("cancel handler is callable (stub — no logic yet)", async () => {
+    const [streamPda] = PublicKey.findProgramAddressSync(
+      [
+        Buffer.from("stream"),
+        sender.publicKey.toBuffer(),
+        recipient.publicKey.toBuffer(),
+        tokenMint.toBuffer(),
+      ],
+      program.programId,
+    );
+    const [escrowPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("escrow"), streamPda.toBuffer()],
+      program.programId,
+    );
+
+    const tx = await program.methods
+      .cancel()
+      .accounts({
+        sender:              sender.publicKey,
+        stream:              streamPda,
+        escrowTokenAccount:  escrowPda,
+        senderTokenAccount,
+        tokenProgram:        TOKEN_PROGRAM_ID,
+        systemProgram:       SystemProgram.programId,
+      })
+      .signers([sender])
+      .rpc({ commitment: "confirmed" });
+
+    console.log("  ✓ cancel tx:", tx);
+
+    const stream = await program.account.streamAccount.fetch(streamPda);
+    expect(stream.isCancelled).to.be.true;
+    console.log("  ✓ stream marked cancelled");
+  });
 });
-
-async function getMXEPublicKeyWithRetry(
-  provider: anchor.AnchorProvider,
-  programId: PublicKey,
-  maxRetries: number = 20,
-  retryDelayMs: number = 500,
-): Promise<Uint8Array> {
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      const mxePublicKey = await getMXEPublicKey(provider, programId);
-      if (mxePublicKey) {
-        return mxePublicKey;
-      }
-    } catch (error) {
-      console.log(`Attempt ${attempt} failed to fetch MXE public key:`, error);
-    }
-
-    if (attempt < maxRetries) {
-      console.log(
-        `Retrying in ${retryDelayMs}ms... (attempt ${attempt}/${maxRetries})`,
-      );
-      await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
-    }
-  }
-
-  throw new Error(
-    `Failed to fetch MXE public key after ${maxRetries} attempts`,
-  );
-}
-
-function readKpJson(path: string): anchor.web3.Keypair {
-  const file = fs.readFileSync(path);
-  return anchor.web3.Keypair.fromSecretKey(
-    new Uint8Array(JSON.parse(file.toString())),
-  );
-}
