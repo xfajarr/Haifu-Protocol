@@ -23,7 +23,6 @@ function MainContent() {
                         <p className="text-xl">Connect your Phantom or Solflare wallet to view your streams.</p>
                     </div>
                 ) : (
-                    {/* Render Dashboard and CreateStreamForm here */}
                     <div className="border border-gray-800 rounded-lg p-6 bg-gray-800/50">
                         <p>Wallet connected. Dashboard goes here.</p>
                     </div>
